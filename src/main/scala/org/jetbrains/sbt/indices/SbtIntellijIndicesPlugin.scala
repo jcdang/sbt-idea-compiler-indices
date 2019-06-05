@@ -1,8 +1,10 @@
 package org.jetbrains.sbt.indices
 
+import java.nio.channels.{FileLock, OverlappingFileLockException}
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
-import org.jetbrains.plugins.scala.indices.protocol.sbt.Locking._
+import org.jetbrains.plugins.scala.indices.protocol.sbt.Locking
 import org.jetbrains.plugins.scala.indices.protocol.sbt.compilationInfoBaseDir
 import org.jetbrains.plugins.scala.indices.protocol.sbt.{Configuration => PConfiguration}
 import org.jetbrains.sbt.indices.SbtCompilationBackCompat._
@@ -59,12 +61,32 @@ object SbtIntellijIndicesPlugin extends AutoPlugin { self =>
         val infoDir         = compilationInfoDir(buildBaseDir, s"$projectId-$configurationId")
         val port            = ideaPort.value
 
-        infoDir.lock(log = log.debug(_))
         val compilationStartTimestamp = System.currentTimeMillis()
+
+        val lockFile = Locking.lockFile(infoDir)
+        var lock: FileLock = null
+
+        while (lock == null) {
+          try {
+            lock = Locking.lock(lockFile)(log.debug(_))
+          } catch {
+            case e: OverlappingFileLockException =>
+              val currentTimestamp = System.currentTimeMillis()
+              if (currentTimestamp - compilationStartTimestamp < TimeUnit.SECONDS.toMillis(30)) {
+                Thread.sleep(10)
+              } else {
+                throw e
+              }
+          }
+        }
 
         val socket =
           try   notifyIdeaStart(port, buildBaseDir.getPath, compilationId)
-          catch { case e: Throwable => infoDir.unlock(log = log.debug(_)); throw e }
+          catch {
+            case e: Throwable =>
+              Locking.unlock(lockFile)(log.debug(_))
+              throw e
+          }
 
         Def.taskDyn {
           val previousResult = itype match {
@@ -120,7 +142,7 @@ object SbtIntellijIndicesPlugin extends AutoPlugin { self =>
             throw cause
           case Value(canalysis) => canalysis
         }.andFinally {
-          try     infoDir.unlock(log = log.debug(_))
+          try     Locking.unlock(lockFile)(log.debug(_))
           finally socket.foreach(_.close())
         }
       }
